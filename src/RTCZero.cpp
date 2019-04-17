@@ -1,5 +1,5 @@
 /*
-  RTC library for Arduino Zero.
+  RTC library for Arduino Zero SAMD21, extended for SAMD51
   Copyright (c) 2015 Arduino LLC. All right reserved.
 
   This library is free software; you can redistribute it and/or
@@ -42,8 +42,10 @@ RTCZero::RTCZero()
 void RTCZero::begin(bool resetTime)
 {
   uint16_t tmp_reg = 0;
-  
+
+#if !defined(__SAMD51__)  
   PM->APBAMASK.reg |= PM_APBAMASK_RTC; // turn on digital interface clock
+#endif 
   config32kOSC();
 
   // If the RTC is in clock mode and the reset was
@@ -52,6 +54,7 @@ void RTCZero::begin(bool resetTime)
   bool validTime = false;
   RTC_MODE2_CLOCK_Type oldTime;
 
+#if !defined(__SAMD51__)
   if ((!resetTime) && (PM->RCAUSE.reg & (PM_RCAUSE_SYST | PM_RCAUSE_WDT | PM_RCAUSE_EXT))) {
     if (RTC->MODE2.CTRL.reg & RTC_MODE2_CTRL_MODE_CLOCK) {
       validTime = true;
@@ -102,6 +105,28 @@ void RTCZero::begin(bool resetTime)
   }
   while (RTCisSyncing())
     ;
+#else
+	configureClock();
+	RTCdisable();
+	RTCreset();
+	
+	tmp_reg |= RTC_MODE2_CTRLA_MODE_CLOCK; // set clock operating mode
+	tmp_reg |= RTC_MODE2_CTRLA_PRESCALER_DIV1024; // set prescaler to 1024 for MODE2
+	tmp_reg &= ~RTC_MODE2_CTRLA_MATCHCLR; // disable clear on match
+	tmp_reg &= ~RTC_MODE2_CTRLA_CLKREP; // 24h time representation //According to the datasheet RTC_MODE2_CTRL_CLKREP = 0 for 24h
+	RTC->MODE2.CTRLA.reg = tmp_reg;
+	while (RTCisSyncing());
+	
+	NVIC_EnableIRQ(RTC_IRQn); // enable RTC interrupt
+	NVIC_SetPriority(RTC_IRQn, 0x00);
+
+	RTC->MODE2.INTENSET.reg					|= RTC_MODE2_INTENSET_ALARM0; // enable alarm interrupt
+	RTC->MODE2.Mode2Alarm[0].MASK.bit.SEL    = MATCH_OFF; // default alarm match is off (disabled)
+	while (RTCisSyncing());
+
+	RTCenable();
+	RTCresetRemove();
+#endif // !defined(__SAMD51__)
 
   _configured = true;
 }
@@ -446,6 +471,8 @@ void RTCZero::setY2kEpoch(uint32_t ts)
 
 /* Attach peripheral clock to 32k oscillator */
 void RTCZero::configureClock() {
+
+#if !defined(__SAMD51__)
   GCLK->GENDIV.reg = GCLK_GENDIV_ID(2)|GCLK_GENDIV_DIV(4);
   while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY)
     ;
@@ -455,6 +482,9 @@ void RTCZero::configureClock() {
   GCLK->CLKCTRL.reg = (uint32_t)((GCLK_CLKCTRL_CLKEN | GCLK_CLKCTRL_GEN_GCLK2 | (RTC_GCLK_ID << GCLK_CLKCTRL_ID_Pos)));
   while (GCLK->STATUS.bit.SYNCBUSY)
     ;
+//#else
+	/* No GCLK required for D51_E5x RTC module */
+#endif // defined(__SAMD51__)
 }
 
 /*
@@ -464,18 +494,42 @@ void RTCZero::configureClock() {
 /* Configure the 32768Hz Oscillator */
 void RTCZero::config32kOSC() 
 {
+#if !defined(__SAMD51__)
   SYSCTRL->XOSC32K.reg = SYSCTRL_XOSC32K_ONDEMAND |
                          SYSCTRL_XOSC32K_RUNSTDBY |
                          SYSCTRL_XOSC32K_EN32K |
                          SYSCTRL_XOSC32K_XTALEN |
                          SYSCTRL_XOSC32K_STARTUP(6) |
                          SYSCTRL_XOSC32K_ENABLE;
+#else
+	
+	/* Selecting the XOSC32k  --> 1k output as RTCclock src*/
+	OSC32KCTRL->RTCCTRL.reg = OSC32KCTRL_RTCCTRL_RTCSEL_XOSC1K;
+	while( (OSC32KCTRL->STATUS.reg & OSC32KCTRL_STATUS_XOSC32KRDY) == 0 );
+
+	/* XOSC32K activated in startup.c but activating again in case USER-code stopped it */
+	/* Enabling the "1k" output */
+	
+	OSC32KCTRL->XOSC32K.reg =   OSC32KCTRL_XOSC32K_XTALEN|
+								OSC32KCTRL_XOSC32K_ENABLE |
+								OSC32KCTRL_XOSC32K_EN32K |
+								OSC32KCTRL_XOSC32K_EN1K |
+								OSC32KCTRL_XOSC32K_CGM_XT |
+								OSC32KCTRL_XOSC32K_RUNSTDBY |
+								OSC32KCTRL_XOSC32K_ONDEMAND |
+								OSC32KCTRL_XOSC32K_STARTUP(3);
+
+#endif //!defined(__SAMD51__)
 }
 
 /* Synchronise the CLOCK register for reading*/
 inline void RTCZero::RTCreadRequest() {
   if (_configured) {
+    #if !defined(__SAMD51__)    
     RTC->MODE2.READREQ.reg = RTC_READREQ_RREQ;
+    #else
+    RTC->MODE2.CTRLA.bit.CLOCKSYNC = 1;
+    #endif
     while (RTCisSyncing())
       ;
   }
@@ -484,33 +538,53 @@ inline void RTCZero::RTCreadRequest() {
 /* Wait for sync in write operations */
 inline bool RTCZero::RTCisSyncing()
 {
+  #if !defined(__SAMD51__)
   return (RTC->MODE2.STATUS.bit.SYNCBUSY);
+  #else
+  return (RTC->MODE2.SYNCBUSY.reg );
+  #endif
 }
 
 void RTCZero::RTCdisable()
 {
+  #if !defined(__SAMD51__)
   RTC->MODE2.CTRL.reg &= ~RTC_MODE2_CTRL_ENABLE; // disable RTC
+  //#else
+  //SAMD51 nop
+  #endif
   while (RTCisSyncing())
     ;
 }
 
 void RTCZero::RTCenable()
 {
+  #if !defined(__SAMD51__)
   RTC->MODE2.CTRL.reg |= RTC_MODE2_CTRL_ENABLE; // enable RTC
+  #else
+  RTC->MODE2.CTRLA.reg |= RTC_MODE2_CTRLA_ENABLE; // enable RTC
+  #endif
   while (RTCisSyncing())
     ;
 }
 
 void RTCZero::RTCreset()
 {
+  #if !defined(__SAMD51__)
   RTC->MODE2.CTRL.reg |= RTC_MODE2_CTRL_SWRST; // software reset
+  //#else
+  //SAMD51 nop
+  #endif
   while (RTCisSyncing())
     ;
 }
 
 void RTCZero::RTCresetRemove()
 {
+  #if !defined(__SAMD51__)
   RTC->MODE2.CTRL.reg &= ~RTC_MODE2_CTRL_SWRST; // software reset remove
+  #else
+  RTC->MODE2.CTRLA.reg &= ~RTC_MODE2_CTRLA_SWRST; // software reset remove
+  #endif 
   while (RTCisSyncing())
     ;
 }
